@@ -1,0 +1,781 @@
+---
+title: "Ranking województw metodą TOPSIS – analiza zmian w latach 2019–2023"
+author: "Anna Oleszko"
+lang: pl
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+    code_folding: hide
+    self_contained: true
+params:
+  rok: 2023
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  dpi = 120
+)
+
+options(scipen = 999)
+
+pakiety <- c(
+  "readxl", "dplyr", "tidyr", "stringr", "ggplot2",
+  "scales", "knitr", "sf", "geodata", "terra", "tibble"
+)
+
+brakujace <- pakiety[!vapply(pakiety, requireNamespace, logical(1), quietly = TRUE)]
+if (length(brakujace) > 0) {
+  stop(
+    "Brakuje wymaganych pakietów: ",
+    paste(brakujace, collapse = ", "),
+    ". Zainstaluj je przed renderowaniem raportu."
+  )
+}
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+library(knitr)
+
+input_file <- knitr::current_input(dir = TRUE)
+project_dir <- if (nzchar(input_file)) {
+  dirname(normalizePath(input_file, winslash = "/", mustWork = FALSE))
+} else {
+  getwd()
+}
+knitr::opts_knit$set(root.dir = project_dir)
+```
+
+# Wstęp
+
+Ranking województw pozwala uporządkować regiony według zestawu wielu kryteriów, ale sama pozycja w rankingu nie pokazuje pełnej skali różnic. Województwo może zajmować pierwsze miejsce przez kilka kolejnych lat, mimo że jego przewaga nad pozostałymi regionami maleje albo rośnie. Analogicznie, region może utrzymywać tę samą pozycję, chociaż jego syntetyczny wynik wyraźnie się poprawia lub pogarsza.
+
+W projekcie analizowane są dane dla polskich województw z lat 2019–2023. Zadanie polega nie tylko na utworzeniu rankingu dla wybranego roku, lecz również na zaproponowaniu sposobu pokazania zmian zachodzących w czasie, których nie widać na podstawie samych miejsc `1, 2, 3, ...`.
+
+Istotnym założeniem jest to, że **rankingów skonstruowanych niezależnie dla poszczególnych lat nie należy bezpośrednio porównywać**, ponieważ w każdym roku punkt odniesienia wyznaczają inne wartości minimalne i maksymalne. Z tego powodu w dalszej części raportu obok rankingu rocznego zbudowano również dodatkowy indeks oparty na wspólnej skali dla całego okresu 2019–2023.
+
+# Cel projektu
+
+Celem analizy jest:
+
+1. utworzenie rankingów województw w programie R,
+2. graficzne przedstawienie rankingu dla wybranego roku,
+3. przedstawienie wyników na mapie Polski w formie kartogramu,
+4. pokazanie zmian zachodzących w czasie, które mogą być niewidoczne w samych pozycjach rankingowych,
+5. wykonanie dodatkowej analizy danych wspierającej interpretację otrzymanych wyników.
+
+W projekcie zastosowano metodę TOPSIS, ponieważ dane zawierają stymulanty i destymulanty, a nie występują nominanty. Oprócz klasycznego rankingu rocznego wykorzystano indeks globalny, lukę do lidera, analizę zmian między pierwszym i ostatnim rokiem, mapę cieplną pozycji oraz analizę stabilności wyników.
+
+# Dane i założenia analizy
+
+## Źródło danych
+
+Plik wejściowy został przekazany przez prowadzącego w ramach zadania projektowego i stanowi bezpośrednią podstawę obliczeń. Dane nie są w tym projekcie pobierane z publicznego API ani z zewnętrznej bazy statystycznej.
+
+W pliku zmienne diagnostyczne są oznaczone technicznymi nazwami `W1`–`W7`. Nie udostępniono ich nazw merytorycznych ani jednostek, dlatego projekt **nie interpretuje rankingu jako rankingu jakości życia, rozwoju gospodarczego lub innego konkretnego zjawiska społeczno-ekonomicznego**. Wnioski dotyczą wyłącznie pozycji województw względem zestawu kryteriów przekazanych w pliku źródłowym oraz zachowania zastosowanej metody rankingowej.
+
+Nazwy kolumn wskazują natomiast charakter każdej zmiennej:
+
+- `*_stymulant` – wyższa wartość jest korzystniejsza,
+- `*_destymulant` – niższa wartość jest korzystniejsza.
+
+W danych nie występują nominanty, czyli zmienne, dla których najlepsza byłaby wartość pośrednia.
+
+## Wczytanie danych
+
+```{r dane}
+plik_domyslny <- file.path(project_dir, "dane_wojewodztwa_stabilne.xlsx")
+
+if (file.exists(plik_domyslny)) {
+  plik <- plik_domyslny
+} else {
+  kandydaci <- list.files(project_dir, pattern = "\\.xlsx$", full.names = TRUE)
+  if (length(kandydaci) == 1) {
+    plik <- kandydaci
+  } else {
+    stop(
+      "Nie znaleziono pliku dane_wojewodztwa_stabilne.xlsx. ",
+      "Umieść plik danych w tym samym folderze co raport."
+    )
+  }
+}
+
+dane <- read_excel(plik, sheet = "DANE") %>%
+  mutate(
+    Województwo = as.character(Województwo),
+    Rok = as.integer(Rok)
+  )
+
+wymagane_id <- c("Województwo", "Rok")
+if (!all(wymagane_id %in% names(dane))) {
+  stop("W pliku brakuje kolumn identyfikacyjnych: Województwo i/lub Rok.")
+}
+
+kable(head(dane, 10), caption = "Pierwsze obserwacje z pliku wejściowego")
+```
+
+## Kontrola jakości danych
+
+Przed utworzeniem rankingu sprawdzono liczbę obserwacji, zakres lat, kompletność danych oraz ewentualne duplikaty par `województwo–rok`.
+
+```{r kontrola-danych}
+zmienne_w <- names(dane) %>% str_subset("^W[0-9]+_(stymulant|destymulant)$")
+
+if (length(zmienne_w) == 0) {
+  stop("Nie znaleziono zmiennych diagnostycznych W*_stymulant / W*_destymulant.")
+}
+
+podsumowanie_danych <- tibble(
+  liczba_obserwacji = nrow(dane),
+  liczba_wojewodztw = n_distinct(dane$Województwo),
+  rok_min = min(dane$Rok, na.rm = TRUE),
+  rok_max = max(dane$Rok, na.rm = TRUE),
+  liczba_zmiennych_diagnostycznych = length(zmienne_w)
+)
+
+kable(podsumowanie_danych, caption = "Podstawowe informacje o zbiorze danych")
+
+braki <- dane %>%
+  summarise(across(everything(), ~ sum(is.na(.x)))) %>%
+  pivot_longer(everything(), names_to = "zmienna", values_to = "liczba_brakow")
+
+kable(braki, caption = "Liczba braków danych według zmiennej")
+
+duplikaty <- dane %>%
+  count(Województwo, Rok, name = "liczba") %>%
+  filter(liczba > 1)
+
+if (nrow(duplikaty) > 0) {
+  stop("W danych występują zduplikowane pary województwo–rok.")
+}
+
+if (anyNA(dane[, zmienne_w])) {
+  stop("Zmienne diagnostyczne zawierają braki danych. Uzupełnij je przed obliczeniem rankingu.")
+}
+```
+
+# Identyfikacja stymulant i destymulant
+
+Podział zmiennych wynika bezpośrednio z nazw kolumn przekazanych w pliku. Stymulanta jest kryterium, którego wyższa wartość działa na korzyść ocenianego województwa, natomiast w przypadku destymulanty korzystniejsza jest wartość niższa.
+
+```{r zmienne}
+stymulanty <- names(dane) %>% str_subset("^W[0-9]+_stymulant$")
+destymulanty <- names(dane) %>% str_subset("^W[0-9]+_destymulant$")
+zmienne_diagnostyczne <- c(stymulanty, destymulanty)
+
+lista_zmiennych <- tibble(
+  zmienna = zmienne_diagnostyczne,
+  charakter = if_else(zmienna %in% stymulanty, "stymulanta", "destymulanta")
+)
+
+kable(lista_zmiennych, caption = "Charakter zmiennych diagnostycznych")
+```
+
+# Metoda rankingowa: TOPSIS
+
+## Uzasadnienie wyboru metody
+
+Do budowy rankingu zastosowano metodę TOPSIS (*Technique for Order Preference by Similarity to Ideal Solution*). Jej zaletą jest to, że nie ogranicza wyniku do samego miejsca w rankingu. Dla każdego województwa powstaje również syntetyczny indeks opisujący względną bliskość do rozwiązania idealnego i odległość od rozwiązania najgorszego.
+
+Jest to szczególnie użyteczne w tym zadaniu, ponieważ pozwala później analizować nie tylko kolejność województw, lecz także skalę różnic pomiędzy nimi.
+
+## Założenie dotyczące wag
+
+W treści zadania nie wskazano, aby którekolwiek kryterium miało być ważniejsze od pozostałych. Ponieważ dodatkowo zmienne mają charakter anonimowy (`W1`–`W7`), nie ma merytorycznych podstaw do nadawania im różnych wag. Przyjęto więc **jednakowe wagi wszystkich kryteriów**.
+
+Dla siedmiu zmiennych każda z nich otrzymuje wagę:
+
+\[
+w_j=\frac{1}{7}.
+\]
+
+Jest to neutralne założenie techniczne, a nie stwierdzenie, że w rzeczywistych zastosowaniach wszystkie potencjalne wskaźniki powinny mieć identyczne znaczenie.
+
+## Normalizacja i konstrukcja indeksu
+
+Zmienne mają różne skale, dlatego przed obliczeniem odległości są przekształcane do przedziału `[0, 1]` metodą min–max.
+
+Dla stymulant:
+
+\[
+z_{ij}=\frac{x_{ij}-\min(x_j)}{\max(x_j)-\min(x_j)}
+\]
+
+Dla destymulant:
+
+\[
+z_{ij}=\frac{\max(x_j)-x_{ij}}{\max(x_j)-\min(x_j)}.
+\]
+
+Po normalizacji wartość `1` oznacza rozwiązanie najbardziej korzystne, a `0` najmniej korzystne dla danego kryterium. Następnie wyznaczana jest ważona odległość od wzorca oraz antywzorca, a indeks TOPSIS ma postać:
+
+\[
+C_i=\frac{D_i^-}{D_i^+ + D_i^-}.
+\]
+
+Im wyższa wartość indeksu, tym wyższa syntetyczna ocena województwa.
+
+```{r funkcje}
+normalizuj <- function(x, typ = c("stymulanta", "destymulanta")) {
+  typ <- match.arg(typ)
+  min_x <- min(x, na.rm = TRUE)
+  max_x <- max(x, na.rm = TRUE)
+
+  # Kryterium stałe nie różnicuje obiektów. Wartość 0.5 jest neutralna
+  # i nie wpływa na kolejność województw.
+  if (isTRUE(all.equal(max_x, min_x))) {
+    return(rep(0.5, length(x)))
+  }
+
+  if (typ == "stymulanta") {
+    (x - min_x) / (max_x - min_x)
+  } else {
+    (max_x - x) / (max_x - min_x)
+  }
+}
+
+policz_topsis <- function(df, sufiks_norm, wagi = NULL) {
+  norm_cols <- names(df) %>% str_subset(paste0(sufiks_norm, "$"))
+
+  if (length(norm_cols) == 0) {
+    stop("Nie znaleziono znormalizowanych zmiennych do obliczenia TOPSIS.")
+  }
+
+  if (is.null(wagi)) {
+    wagi <- rep(1 / length(norm_cols), length(norm_cols))
+  }
+
+  if (length(wagi) != length(norm_cols) || any(wagi < 0) || sum(wagi) <= 0) {
+    stop("Niepoprawny wektor wag.")
+  }
+
+  wagi <- wagi / sum(wagi)
+
+  df %>%
+    rowwise() %>%
+    mutate(
+      d_plus = sqrt(sum(wagi * (c_across(all_of(norm_cols)) - 1)^2)),
+      d_minus = sqrt(sum(wagi * (c_across(all_of(norm_cols)) - 0)^2)),
+      indeks = d_minus / (d_plus + d_minus)
+    ) %>%
+    ungroup()
+}
+```
+
+# Ranking liczony osobno dla każdego roku
+
+Pierwszy ranking jest tworzony niezależnie dla każdego roku. Oznacza to, że wartości minimalne i maksymalne używane w normalizacji pochodzą wyłącznie z obserwacji danego roku.
+
+Tak obliczony ranking poprawnie odpowiada na pytanie **„które województwo wypada najlepiej na tle pozostałych w tym konkretnym roku?”**, ale nie powinien być używany do bezpośredniego mierzenia poprawy lub pogorszenia między latami. Punkt odniesienia zmienia się bowiem z roku na rok.
+
+```{r ranking-roczny}
+ranking_roczny <- dane %>%
+  group_by(Rok) %>%
+  mutate(
+    across(all_of(stymulanty), ~ normalizuj(.x, "stymulanta"), .names = "{.col}_norm_roczna"),
+    across(all_of(destymulanty), ~ normalizuj(.x, "destymulanta"), .names = "{.col}_norm_roczna")
+  ) %>%
+  ungroup() %>%
+  policz_topsis("_norm_roczna") %>%
+  rename(indeks_roczny = indeks) %>%
+  select(Województwo, Rok, all_of(zmienne_diagnostyczne), indeks_roczny) %>%
+  group_by(Rok) %>%
+  mutate(ranking = dense_rank(desc(indeks_roczny))) %>%
+  ungroup() %>%
+  arrange(Rok, ranking)
+
+kable(
+  ranking_roczny %>%
+    filter(Rok == params$rok) %>%
+    select(ranking, Województwo, indeks_roczny),
+  digits = 3,
+  caption = paste("Ranking roczny TOPSIS dla roku", params$rok)
+)
+```
+
+# Indeks globalny do porównywania zmian w czasie
+
+Aby pokazać zmiany, których nie widać w samych miejscach rankingowych, zbudowano drugi indeks. Tym razem wartości minimalne i maksymalne dla każdego kryterium są wyznaczane **na podstawie całego okresu 2019–2023**, a nie osobno dla każdego roku.
+
+Dzięki stałej bazie odniesienia wartości indeksu globalnego są porównywalne w obrębie analizowanego zbioru i można oceniać, czy wynik danego województwa wzrósł, spadł oraz czy zmniejsza się jego dystans do lidera.
+
+```{r indeks-globalny}
+indeks_globalny <- dane %>%
+  mutate(
+    across(all_of(stymulanty), ~ normalizuj(.x, "stymulanta"), .names = "{.col}_norm_globalna"),
+    across(all_of(destymulanty), ~ normalizuj(.x, "destymulanta"), .names = "{.col}_norm_globalna")
+  ) %>%
+  policz_topsis("_norm_globalna") %>%
+  rename(indeks_globalny = indeks) %>%
+  select(Województwo, Rok, indeks_globalny)
+
+wyniki <- ranking_roczny %>%
+  select(Województwo, Rok, ranking, indeks_roczny) %>%
+  left_join(indeks_globalny, by = c("Województwo", "Rok")) %>%
+  group_by(Rok) %>%
+  mutate(
+    ranking_globalny_w_roku = dense_rank(desc(indeks_globalny)),
+    lider_globalny = max(indeks_globalny, na.rm = TRUE),
+    luka_do_lidera = lider_globalny - indeks_globalny
+  ) %>%
+  ungroup()
+
+kable(
+  wyniki %>%
+    filter(Rok == params$rok) %>%
+    arrange(ranking) %>%
+    select(ranking, Województwo, indeks_roczny, indeks_globalny, luka_do_lidera),
+  digits = 3,
+  caption = paste("Ranking oraz miary porównywalne w czasie dla roku", params$rok)
+)
+```
+
+# Wizualizacja rankingu dla wybranego roku
+
+Rok prezentowany na wykresie i kartogramie jest sterowany parametrem `params$rok` w nagłówku dokumentu. Dzięki temu ten sam raport można wygenerować dla dowolnego roku występującego w danych bez modyfikowania kodu analitycznego.
+
+```{r wykres-ranking}
+rok_analizy <- params$rok
+
+if (!rok_analizy %in% unique(wyniki$Rok)) {
+  stop("Wybrany rok nie występuje w danych. Zmień parametr params$rok w nagłówku R Markdown.")
+}
+
+wyniki_rok <- wyniki %>% filter(Rok == rok_analizy)
+
+ggplot(wyniki_rok, aes(x = indeks_roczny, y = reorder(Województwo, indeks_roczny))) +
+  geom_col(width = 0.7) +
+  geom_text(aes(label = paste0("m. ", ranking)), hjust = -0.1, size = 3.5) +
+  scale_x_continuous(
+    labels = number_format(accuracy = 0.01),
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = paste("Ranking województw metodą TOPSIS w roku", rok_analizy),
+    subtitle = "Indeks roczny jest liczony względem minimum i maksimum w danym roku",
+    x = "Indeks TOPSIS – ranking roczny",
+    y = NULL
+  ) +
+  theme_minimal()
+```
+
+# Kartogram dla wybranego roku
+
+Kartogram pozwala jednocześnie zobaczyć przestrzenne rozmieszczenie wyników i miejsca rankingowe. Granice administracyjne są pobierane z bazy GADM za pomocą pakietu `geodata`. Dane geograficzne służą wyłącznie do wizualizacji – wartości używane w rankingu pochodzą z pliku przekazanego przez prowadzącego.
+
+Przy pierwszym uruchomieniu tej części raportu potrzebne jest połączenie z internetem. Jeżeli środowisko nie pozwala na pobranie granic, pozostałe części analizy mogą zostać wykonane niezależnie.
+
+```{r kartogram}
+mapa_wyniki <- tryCatch({
+  dir.create(file.path(project_dir, "granice"), showWarnings = FALSE)
+
+  gadm <- geodata::gadm(
+    country = "POL",
+    level = 1,
+    path = file.path(project_dir, "granice")
+  )
+  mapa_sf <- sf::st_as_sf(gadm)
+
+  ascii <- function(x) tolower(iconv(x, from = "", to = "ASCII//TRANSLIT"))
+  kolumna_nazw <- intersect(c("NAME_1", "name", "region"), names(mapa_sf))[1]
+
+  if (is.na(kolumna_nazw)) {
+    stop("Nie udało się zidentyfikować kolumny z nazwą regionu w danych mapowych.")
+  }
+
+  slownik <- tibble::tibble(
+    map_key = c(
+      "dolnoslaskie", "lower silesian",
+      "kujawsko-pomorskie", "kuyavian-pomeranian",
+      "lubelskie", "lublin",
+      "lubuskie", "lubusz",
+      "lodzkie", "lodz",
+      "malopolskie", "lesser poland",
+      "mazowieckie", "masovian",
+      "opolskie", "opole",
+      "podkarpackie", "subcarpathian",
+      "podlaskie", "podlasie",
+      "pomorskie", "pomeranian",
+      "slaskie", "silesian",
+      "swietokrzyskie", "holy cross",
+      "warminsko-mazurskie", "warmian-masurian",
+      "wielkopolskie", "greater poland",
+      "zachodniopomorskie", "west pomeranian"
+    ),
+    Województwo = rep(c(
+      "Dolnośląskie", "Kujawsko-pomorskie", "Lubelskie", "Lubuskie",
+      "Łódzkie", "Małopolskie", "Mazowieckie", "Opolskie",
+      "Podkarpackie", "Podlaskie", "Pomorskie", "Śląskie",
+      "Świętokrzyskie", "Warmińsko-mazurskie", "Wielkopolskie", "Zachodniopomorskie"
+    ), each = 2)
+  )
+
+  mapa_sf %>%
+    mutate(map_key = ascii(.data[[kolumna_nazw]])) %>%
+    left_join(slownik, by = "map_key") %>%
+    left_join(wyniki_rok, by = "Województwo")
+}, error = function(e) {
+  message("Nie udało się pobrać lub połączyć mapy: ", e$message)
+  NULL
+})
+
+if (!is.null(mapa_wyniki)) {
+  ggplot(mapa_wyniki) +
+    geom_sf(aes(fill = indeks_roczny), color = "white", linewidth = 0.25) +
+    geom_sf_text(aes(label = ranking), size = 3) +
+    scale_fill_viridis_c(
+      option = "C",
+      labels = number_format(accuracy = 0.01),
+      na.value = "grey90"
+    ) +
+    labs(
+      title = paste("Kartogram rankingu województw w roku", rok_analizy),
+      subtitle = "Kolor przedstawia indeks TOPSIS, a liczba – miejsce w rankingu",
+      fill = "Indeks\nTOPSIS"
+    ) +
+    theme_void()
+} else {
+  cat("Kartogram nie został wygenerowany, ponieważ nie udało się pobrać lub połączyć granic administracyjnych.")
+}
+```
+
+# Zmiany niewidoczne w samym rankingu
+
+Sama pozycja `1, 2, 3, ...` może ukrywać istotne zmiany. Województwo może utrzymać to samo miejsce, ale jego przewaga nad kolejnymi regionami może rosnąć albo maleć. Z drugiej strony region może poprawić wartość wszystkich lub większości kryteriów, a mimo to nie awansować, jeżeli pozostałe województwa poprawiają się w podobnym tempie.
+
+Dlatego analizę zmian oparto na czterech uzupełniających perspektywach:
+
+1. zmianie porównywalnego indeksu globalnego w czasie,
+2. luce do lidera w każdym roku,
+3. stabilności miejsc rankingowych,
+4. zmianie między pierwszym i ostatnim rokiem obserwacji.
+
+## Trend indeksu globalnego
+
+```{r trend-globalny}
+ggplot(wyniki, aes(x = Rok, y = indeks_globalny, group = Województwo)) +
+  geom_line(alpha = 0.65) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(breaks = sort(unique(wyniki$Rok))) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = "Zmiany indeksu globalnego województw",
+    subtitle = "Wspólna baza min–max dla całego okresu umożliwia porównanie zmian w czasie",
+    x = "Rok",
+    y = "Indeks globalny TOPSIS"
+  ) +
+  theme_minimal()
+```
+
+W przeciwieństwie do indeksu rocznego wartości na tym wykresie korzystają z jednego punktu odniesienia. Wzrost linii oznacza poprawę syntetycznego wyniku względem wspólnej skali 2019–2023, a spadek – jego pogorszenie.
+
+## Luka do lidera
+
+```{r luka-lider}
+ggplot(wyniki, aes(x = Rok, y = luka_do_lidera, group = Województwo)) +
+  geom_line(alpha = 0.65) +
+  geom_point(size = 1.8) +
+  scale_x_continuous(breaks = sort(unique(wyniki$Rok))) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = "Odległość od lidera w ujęciu porównywalnym między latami",
+    subtitle = "Spadek luki oznacza doganianie lidera, a wzrost – zwiększanie dystansu",
+    x = "Rok",
+    y = "Luka do lidera według indeksu globalnego"
+  ) +
+  theme_minimal()
+```
+
+Miara ta odpowiada bezpośrednio na problem postawiony w zadaniu: nawet jeżeli lider się nie zmienia, można sprawdzić, czy pozostałe województwa się do niego zbliżają, czy też jego przewaga rośnie.
+
+## Mapa cieplna pozycji rankingowych
+
+```{r heatmap-ranking}
+ggplot(
+  wyniki,
+  aes(x = factor(Rok), y = reorder(Województwo, -ranking), fill = ranking)
+) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ranking), size = 3) +
+  scale_fill_viridis_c(direction = -1, breaks = c(1, 4, 8, 12, 16)) +
+  labs(
+    title = "Pozycje rankingowe województw w kolejnych latach",
+    subtitle = "Wykres pokazuje stabilność i przesunięcia miejsc, ale nie pokazuje skali różnic",
+    x = "Rok",
+    y = NULL,
+    fill = "Miejsce"
+  ) +
+  theme_minimal()
+```
+
+Mapa cieplna dobrze pokazuje, które województwa są stabilne rankingowo, a które często zmieniają pozycję. Nie zastępuje jednak indeksu globalnego, ponieważ sama zmiana miejsca nadal nie informuje o wielkości różnicy między regionami.
+
+## Porównanie pierwszego i ostatniego roku
+
+```{r zmiana-pierwszy-ostatni}
+rok_min <- min(wyniki$Rok)
+rok_max <- max(wyniki$Rok)
+
+porownanie_lat <- wyniki %>%
+  filter(Rok %in% c(rok_min, rok_max)) %>%
+  select(Województwo, Rok, indeks_globalny) %>%
+  pivot_wider(names_from = Rok, values_from = indeks_globalny, names_prefix = "rok_") %>%
+  mutate(
+    zmiana = .data[[paste0("rok_", rok_max)]] - .data[[paste0("rok_", rok_min)]]
+  ) %>%
+  arrange(desc(zmiana))
+
+kable(
+  porownanie_lat,
+  digits = 3,
+  caption = paste("Zmiana indeksu globalnego między", rok_min, "a", rok_max)
+)
+
+porownanie_long <- porownanie_lat %>%
+  select(Województwo, starts_with("rok_")) %>%
+  pivot_longer(
+    starts_with("rok_"),
+    names_to = "rok",
+    values_to = "indeks_globalny"
+  ) %>%
+  mutate(rok = as.integer(str_remove(rok, "rok_")))
+
+ggplot(
+  porownanie_long,
+  aes(
+    x = indeks_globalny,
+    y = reorder(Województwo, indeks_globalny),
+    group = Województwo
+  )
+) +
+  geom_line(linewidth = 0.8, alpha = 0.75) +
+  geom_point(aes(shape = factor(rok)), size = 2.8) +
+  scale_x_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title = paste("Zmiana syntetycznej oceny między", rok_min, "a", rok_max),
+    subtitle = "Wykres pokazuje skalę zmiany, której nie widać w samych miejscach rankingowych",
+    x = "Indeks globalny TOPSIS",
+    y = NULL,
+    shape = "Rok"
+  ) +
+  theme_minimal()
+```
+
+## Stabilność pozycji województw
+
+Dodatkowo obliczono zakres miejsc zajmowanych przez każde województwo w całym analizowanym okresie. Mały zakres oznacza stabilną pozycję, natomiast duży wskazuje na większą zmienność miejsca w rankingu.
+
+```{r stabilnosc-rankingu}
+stabilnosc <- wyniki %>%
+  group_by(Województwo) %>%
+  summarise(
+    najlepsze_miejsce = min(ranking),
+    najgorsze_miejsce = max(ranking),
+    zakres_miejsc = max(ranking) - min(ranking),
+    srednie_miejsce = mean(ranking),
+    sd_miejsca = sd(ranking),
+    .groups = "drop"
+  ) %>%
+  arrange(zakres_miejsc, srednie_miejsce)
+
+kable(
+  stabilnosc,
+  digits = 2,
+  caption = "Stabilność pozycji rankingowych województw w latach 2019–2023"
+)
+```
+
+# Dodatkowa analiza danych
+
+## Statystyki opisowe wskaźników
+
+Statystyki opisowe pomagają ocenić zakres oraz zmienność kryteriów jeszcze przed agregacją ich do jednej miary syntetycznej.
+
+```{r analiza-wstepna}
+statystyki <- dane %>%
+  summarise(
+    across(
+      all_of(zmienne_diagnostyczne),
+      list(min = min, max = max, mean = mean, sd = sd),
+      .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  pivot_longer(everything(), names_to = "miara", values_to = "wartosc") %>%
+  separate(miara, into = c("zmienna", "statystyka"), sep = "_(?=[^_]+$)") %>%
+  pivot_wider(names_from = statystyka, values_from = wartosc)
+
+kable(
+  statystyki,
+  digits = 2,
+  caption = "Statystyki opisowe wskaźników diagnostycznych"
+)
+```
+
+## Korelacje pomiędzy kryteriami
+
+Macierz korelacji pokazuje, czy niektóre kryteria poruszają się w podobny sposób. Silna korelacja nie oznacza automatycznie, że zmienną należy usunąć, ale może wskazywać, że część informacji w rankingu jest powielana przez kilka wskaźników.
+
+```{r korelacje}
+korelacje <- dane %>%
+  select(all_of(zmienne_diagnostyczne)) %>%
+  cor(use = "pairwise.complete.obs") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("zmienna_1") %>%
+  pivot_longer(-zmienna_1, names_to = "zmienna_2", values_to = "korelacja")
+
+ggplot(korelacje, aes(x = zmienna_1, y = zmienna_2, fill = korelacja)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = number(korelacja, accuracy = 0.01)), size = 3) +
+  scale_fill_gradient2(limits = c(-1, 1), labels = number_format(accuracy = 0.1)) +
+  labs(
+    title = "Macierz korelacji wskaźników",
+    x = NULL,
+    y = NULL,
+    fill = "Korelacja"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Analiza wrażliwości rankingu
+
+Ponieważ wszystkie kryteria otrzymały jednakowe wagi, warto sprawdzić, czy wynik nie zależy nadmiernie od pojedynczej zmiennej. W tym celu dla wybranego roku ranking jest liczony ponownie siedem razy – za każdym razem po pominięciu jednego kryterium.
+
+Dla każdej wersji obliczana jest korelacja rang Spearmana z rankingiem bazowym oraz maksymalna i średnia zmiana pozycji. Im wyższa korelacja i mniejsze przesunięcia, tym bardziej stabilny jest ranking względem pojedynczego kryterium.
+
+```{r wrazliwosc}
+bazowy <- ranking_roczny %>%
+  filter(Rok == rok_analizy) %>%
+  select(Województwo, ranking_bazowy = ranking)
+
+dane_rok_sens <- dane %>% filter(Rok == rok_analizy)
+
+wrazliwosc <- lapply(zmienne_diagnostyczne, function(pominieta) {
+  pozostale <- setdiff(zmienne_diagnostyczne, pominieta)
+  tmp <- dane_rok_sens
+
+  for (zm in pozostale) {
+    typ_zm <- if (zm %in% stymulanty) "stymulanta" else "destymulanta"
+    tmp[[paste0(zm, "_norm_sens")]] <- normalizuj(tmp[[zm]], typ_zm)
+  }
+
+  alt <- tmp %>%
+    policz_topsis("_norm_sens") %>%
+    mutate(ranking_alt = dense_rank(desc(indeks))) %>%
+    select(Województwo, ranking_alt)
+
+  por <- bazowy %>% left_join(alt, by = "Województwo")
+  przesuniecie <- abs(por$ranking_bazowy - por$ranking_alt)
+
+  tibble(
+    pominieta_zmienna = pominieta,
+    korelacja_spearmana = cor(
+      por$ranking_bazowy,
+      por$ranking_alt,
+      method = "spearman"
+    ),
+    maksymalna_zmiana_miejsca = max(przesuniecie),
+    srednia_zmiana_miejsca = mean(przesuniecie)
+  )
+}) %>%
+  bind_rows() %>%
+  arrange(korelacja_spearmana)
+
+kable(
+  wrazliwosc,
+  digits = 3,
+  caption = paste("Wrażliwość rankingu", rok_analizy, "na pominięcie pojedynczego kryterium")
+)
+```
+
+# Najważniejsze wyniki
+
+```{r wnioski-obliczenia, include=FALSE}
+liderzy <- wyniki %>%
+  group_by(Rok) %>%
+  slice_min(ranking, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  select(Rok, lider = Województwo, indeks_roczny, indeks_globalny)
+
+najwieksza_poprawa <- porownanie_lat %>% slice_max(zmiana, n = 3)
+najwiekszy_spadek <- porownanie_lat %>% slice_min(zmiana, n = 3)
+
+lider_najczestszy <- names(sort(table(liderzy$lider), decreasing = TRUE))[1]
+lata_lidera <- sum(liderzy$lider == lider_najczestszy)
+liczba_lat <- n_distinct(wyniki$Rok)
+
+max_poprawa_woj <- najwieksza_poprawa$Województwo[1]
+max_poprawa_val <- najwieksza_poprawa$zmiana[1]
+max_spadek_woj <- najwiekszy_spadek$Województwo[1]
+max_spadek_val <- najwiekszy_spadek$zmiana[1]
+```
+
+```{r tabele-wnioskow}
+kable(liderzy, digits = 3, caption = "Liderzy rankingu w kolejnych latach")
+
+kable(
+  najwieksza_poprawa,
+  digits = 3,
+  caption = paste("Największa poprawa indeksu globalnego między", rok_min, "a", rok_max)
+)
+
+kable(
+  najwiekszy_spadek,
+  digits = 3,
+  caption = paste("Największy spadek indeksu globalnego między", rok_min, "a", rok_max)
+)
+```
+
+W analizowanym okresie województwo **`r lider_najczestszy`** zajmowało pierwsze miejsce w `r lata_lidera` z `r liczba_lat` analizowanych lat. Sama stabilność lidera nie oznacza jednak braku zmian w pozostałej części rankingu.
+
+Między `r rok_min` a `r rok_max` największy wzrost porównywalnego indeksu globalnego odnotowało województwo **`r max_poprawa_woj`** (`r number(max_poprawa_val, accuracy = 0.001)`), natomiast największy spadek wystąpił w województwie **`r max_spadek_woj`** (`r number(max_spadek_val, accuracy = 0.001)`).
+
+Najważniejszym wnioskiem metodologicznym jest to, że **ranking roczny i analiza zmian odpowiadają na dwa różne pytania**. Ranking roczny pokazuje pozycję województwa na tle innych regionów w konkretnym roku. Indeks globalny pokazuje natomiast, czy syntetyczna ocena regionu zmienia się na wspólnej skali w całym okresie. Dopiero zestawienie obu perspektyw pozwala odróżnić zmianę miejsca od rzeczywistego zwiększenia lub zmniejszenia dystansu względem pozostałych województw.
+
+# Ograniczenia analizy
+
+Interpretując wyniki należy uwzględnić kilka ograniczeń:
+
+1. **Anonimowe kryteria.** Plik źródłowy nie zawiera merytorycznych nazw ani jednostek zmiennych `W1`–`W7`. Z tego powodu nie można nadawać rankingowi szerszej interpretacji społecznej lub gospodarczej bez dodatkowej dokumentacji danych.
+2. **Równe wagi.** Wszystkie kryteria są traktowane jednakowo, ponieważ w zadaniu nie określono hierarchii ich ważności. Inny system wag może prowadzić do innego uporządkowania województw.
+3. **Względny charakter rankingu.** Wynik TOPSIS opisuje pozycję obiektu względem pozostałych obserwacji w analizowanym zbiorze, a nie absolutny poziom badanego zjawiska.
+4. **Zależność od zakresu danych.** Normalizacja min–max zależy od obserwowanych wartości minimalnych i maksymalnych. Dołączenie nowych lat lub nowych obserwacji może zmienić skalę i wymaga ponownego przeliczenia indeksów.
+5. **Porównywalność indeksu globalnego.** Indeks globalny jest porównywalny w ramach tej samej definicji kryteriów, zestawu województw i przyjętego okresu 2019–2023. Nie powinien być automatycznie porównywany z indeksem wyliczonym na innej bazie danych.
+6. **Brak interpretacji przyczynowej.** Ranking opisuje względne wyniki województw według przekazanych kryteriów. Nie wyjaśnia przyczyn różnic między regionami.
+
+# Podsumowanie
+
+Projekt realizuje dwa uzupełniające cele. Po pierwsze, metoda TOPSIS pozwala utworzyć ranking województw dla wybranego roku na podstawie wielu stymulant i destymulant. Po drugie, zastosowanie dodatkowego indeksu globalnego umożliwia analizę zmian w czasie na wspólnej skali, dzięki czemu można dostrzec zjawiska niewidoczne w samych pozycjach rankingowych.
+
+Najważniejszym rozszerzeniem klasycznego rankingu jest analiza **luki do lidera**. Pozwala ona odpowiedzieć na pytanie, czy województwa zajmujące niższe pozycje doganiają najlepszy region, czy przeciwnie – dystans między nimi się zwiększa. Uzupełnieniem są wykres zmian indeksu globalnego, mapa cieplna pozycji, porównanie pierwszego i ostatniego roku oraz analiza stabilności miejsc.
+
+Projekt pokazuje również, że samo miejsce w rankingu może być mylące. Brak zmiany pozycji nie musi oznaczać braku zmian w danych, a awans lub spadek o jedno miejsce nie informuje o skali różnicy między województwami. Z tego powodu przy analizie rankingów warto prezentować zarówno kolejność obiektów, jak i wartości syntetycznego miernika oraz dystans pomiędzy nimi.
+
+Wyniki należy interpretować w granicach przekazanego zbioru danych. Ze względu na anonimowy charakter zmiennych projekt ma przede wszystkim charakter **metodologiczny**: demonstruje sposób budowy wielokryterialnego rankingu, jego wizualizacji oraz analizowania zmian względnych w czasie, bez przypisywania zmiennym znaczenia, którego nie dostarczono w danych źródłowych.
+
+# Informacje o odtwarzalności
+
+Do ponownego wykonania analizy potrzebne są:
+
+- plik `.Rmd`,
+- plik `dane_wojewodztwa_stabilne.xlsx` z arkuszem `DANE`,
+- pakiety R wymienione w sekcji konfiguracyjnej,
+- połączenie z internetem przy pierwszym pobieraniu granic województw do kartogramu.
+
+Rok prezentowany na głównym wykresie oraz kartogramie można zmienić parametrem `rok` w nagłówku dokumentu.
+
+```{r informacje-sesji, echo=FALSE}
+cat("Raport wygenerowano w środowisku R. Wersja R:", R.version.string)
+```
